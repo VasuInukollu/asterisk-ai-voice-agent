@@ -108,6 +108,11 @@ class CallSession:
     cleanup_in_progress: bool = False
     cleanup_completed: bool = False
     call_outcome: str = ""  # caller_hangup | agent_hangup | transferred
+    # Continue in dialplan (exit Stasis and return control to the dialplan)
+    continue_after_tts: bool = False
+    continue_dialplan_context: Optional[str] = None
+    continue_dialplan_extension: str = "s"
+    continue_dialplan_priority: int = 1
     pending_local_channel_id: Optional[str] = None
     pending_external_media_id: Optional[str] = None
     ssrc: Optional[int] = None

@@ -4144,10 +4144,137 @@ class Engine:
         except Exception as exc:
             logger.error("Error handling ChannelDestroyed", error=str(exc), exc_info=True)
 
+    async def _execute_continue_in_dialplan(self, session) -> None:
+        """Exit Stasis for ``session.caller_channel_id`` and resume dialplan execution.
+
+        Reads the target context/extension/priority from the session fields set by
+        ``ContinueInDialplanTool`` and calls ARI ``POST /channels/{id}/continue``.
+        Falls back to sensible defaults when fields are missing.
+        """
+        channel_id = session.caller_channel_id
+        dialplan_context = getattr(session, "continue_dialplan_context", None) or "default"
+        extension = getattr(session, "continue_dialplan_extension", None) or "s"
+        priority = getattr(session, "continue_dialplan_priority", 1) or 1
+        try:
+            priority = int(priority)
+        except (TypeError, ValueError):
+            priority = 1
+
+        logger.info(
+            "🔀 Executing continue in dialplan",
+            channel_id=channel_id,
+            dialplan_context=dialplan_context,
+            extension=extension,
+            priority=priority,
+        )
+        try:
+            ok = await self.ari_client.continue_in_dialplan(
+                channel_id,
+                context=dialplan_context,
+                extension=extension,
+                priority=priority,
+            )
+            if ok:
+                logger.info(
+                    "✅ Continue in dialplan succeeded",
+                    channel_id=channel_id,
+                    dialplan_context=dialplan_context,
+                    extension=extension,
+                    priority=priority,
+                )
+            else:
+                logger.warning(
+                    "Continue in dialplan returned failure status",
+                    channel_id=channel_id,
+                    dialplan_context=dialplan_context,
+                )
+        except Exception as exc:
+            logger.error(
+                "Error calling continue_in_dialplan",
+                channel_id=channel_id,
+                error=str(exc),
+                exc_info=True,
+            )
+
+    async def _handle_caller_dtmf_continue(self, channel_id: str, digit: str) -> None:
+        """Trigger continue-in-dialplan when caller presses a configured DTMF digit.
+
+        Requires ``tools.continue_in_dialplan.dtmf_enabled: true`` in the agent config.
+        The allowed digits default to ``["*", "#"]`` and can be customised via
+        ``tools.continue_in_dialplan.dtmf_digits``.
+        The caller must be on an active Stasis channel mapped to a known session.
+        """
+        try:
+            # Look up the session by caller channel id.
+            session = await self.session_store.get_by_channel_id(channel_id)
+            if not session or session.caller_channel_id != channel_id:
+                return
+
+            # Only act if DTMF-triggered continue is configured.
+            tools_cfg = getattr(self.config, "tools", {}) or {}
+            continue_cfg = tools_cfg.get("continue_in_dialplan", {}) if isinstance(tools_cfg, dict) else {}
+            if not isinstance(continue_cfg, dict):
+                continue_cfg = {}
+
+            # Feature must be explicitly enabled; read allowed digits (default * and #).
+            if not continue_cfg.get("dtmf_enabled", False):
+                return
+
+            dtmf_digits = continue_cfg.get("dtmf_digits", ["*", "#"])
+            if not isinstance(dtmf_digits, (list, tuple)):
+                dtmf_digits = [str(dtmf_digits)]
+
+            if digit not in [str(d) for d in dtmf_digits]:
+                return
+
+            # Skip if a cleanup or continue is already in progress.
+            if getattr(session, "cleanup_in_progress", False) or getattr(session, "cleanup_after_tts", False):
+                return
+            if getattr(session, "continue_after_tts", False):
+                return
+
+            logger.info(
+                "📞 DTMF-triggered continue in dialplan",
+                channel_id=channel_id,
+                digit=digit,
+                call_id=session.call_id,
+            )
+
+            # Apply config-level routing defaults; dialplan tool values take precedence
+            # if the tool has already set them, but since this path is DTMF-triggered
+            # before the tool runs we read straight from config.
+            dialplan_context = continue_cfg.get("context", "default")
+            extension = continue_cfg.get("extension", "s")
+            priority = continue_cfg.get("priority", 1)
+            try:
+                priority = int(priority)
+            except (TypeError, ValueError):
+                priority = 1
+
+            # Persist continue target onto the session so cleanup logic can inspect it.
+            session.continue_after_tts = True
+            session.continue_dialplan_context = str(dialplan_context)
+            session.continue_dialplan_extension = str(extension)
+            session.continue_dialplan_priority = priority
+            await self._save_session(session)
+
+            # Execute the continue immediately (no TTS farewell in DTMF path).
+            await self._execute_continue_in_dialplan(session)
+        except Exception as exc:
+            logger.error(
+                "Error in DTMF-triggered continue handler",
+                channel_id=channel_id,
+                digit=digit,
+                error=str(exc),
+                exc_info=True,
+            )
+
     async def _handle_dtmf_received(self, event: dict):
         """Handle ChannelDtmfReceived events.
 
         Used by attended_transfer to collect agent acceptance/decline digits.
+        Also handles DTMF-triggered continue-in-dialplan for the caller channel
+        when ``tools.continue_in_dialplan.dtmf_enabled`` is true in the config.
         """
         try:
             channel = event.get("channel", {}) or {}
@@ -4164,6 +4291,9 @@ class Engine:
 
             call_id = self._attended_transfer_agent_channel_to_call_id.get(channel_id)
             if not call_id:
+                # Not an attended-transfer agent channel.
+                # Check whether this is a caller channel with DTMF-triggered continue enabled.
+                await self._handle_caller_dtmf_continue(channel_id, str(digit))
                 return
 
             # Record first decision digit only (early DTMF during announcement is honored).
@@ -8499,6 +8629,9 @@ class Engine:
                                 logger.info("✅ Call hung up successfully", call_id=call_id, channel_id=session.caller_channel_id)
                             except Exception as e:
                                 logger.error("Failed to hang up call", call_id=call_id, error=str(e), exc_info=True)
+                        elif session and getattr(session, 'continue_after_tts', False):
+                            logger.info("🔀 Continue in dialplan after TTS requested", call_id=call_id)
+                            await self._execute_continue_in_dialplan(session)
                     except Exception as e:
                         logger.debug("Error checking cleanup_after_tts flag", call_id=call_id, error=str(e))
             
